@@ -16,5 +16,7 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
-# Logs
+# Logs and runtime reports
 *.log
+calibration_profile.json
+accuracy_report_*.json

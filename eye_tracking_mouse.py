@@ -114,8 +114,12 @@ class EyeTrackerConfig:
     INVERT_Y: bool = False                  # False = Natural (Tilt Up -> Moves Up)
 
     # --------------------------------------------------------------------------
-    # Operational Modes
+    # Operational Modes & Machine Learning Calibration
     # --------------------------------------------------------------------------
+    USE_NEURAL_BLENDSHAPES: bool = True     # Use MediaPipe neural blendshapes for blink detection
+    BLENDSHAPE_BLINK_THRESHOLD: float = 0.45 # Probability threshold for deliberate wink (0.0 to 1.0)
+    USE_POLYNOMIAL_CALIBRATION: bool = True # Use Degree-2 Polynomial Ridge Model when calibrated
+    CALIBRATION_PROFILE_PATH: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration_profile.json")
     ENABLE_MOUSE_CONTROL: bool = True       # True = physically move cursor; False = preview HUD
     SHOW_DEBUG_HUD: bool = True             # Overlay real-time EAR meters and active monitor indicator
     MODEL_TASK_PATH: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "face_landmarker.task")  # MediaPipe vision model bundle path
@@ -323,28 +327,35 @@ class FaceMeshAdapter:
             options = vision.FaceLandmarkerOptions(
                 base_options=base_options,
                 running_mode=vision.RunningMode.IMAGE,
-                num_faces=1
+                num_faces=1,
+                output_face_blendshapes=True,
+                output_facial_transformation_matrixes=True
             )
             self.detector = vision.FaceLandmarker.create_from_options(options)
-            print("[MediaPipe Adapter] Initialized via modern mediapipe.tasks.vision.FaceLandmarker API.")
+            print("[MediaPipe Adapter] Initialized via modern mediapipe.tasks.vision.FaceLandmarker API (Neural Blendshapes Enabled).")
         else:
             raise RuntimeError("Incompatible MediaPipe version.")
 
-    def process(self, frame_bgr: np.ndarray) -> Optional[List[Any]]:
-        """Runs face mesh inference and returns 478 normalized landmarks."""
+    def process(self, frame_bgr: np.ndarray) -> Tuple[Optional[List[Any]], Dict[str, float]]:
+        """Runs face mesh inference and returns (478 normalized landmarks, blendshapes_dict)."""
         rgb_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         if self.mode == "solutions":
             results = self.detector.process(rgb_frame)
             if results.multi_face_landmarks:
-                return results.multi_face_landmarks[0].landmark
-            return None
+                return results.multi_face_landmarks[0].landmark, {}
+            return None, {}
         elif self.mode == "tasks":
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
             results = self.detector.detect(mp_image)
             if results.face_landmarks and len(results.face_landmarks) > 0:
-                return results.face_landmarks[0]
-            return None
-        return None
+                landmarks = results.face_landmarks[0]
+                blendshapes = {}
+                if results.face_blendshapes and len(results.face_blendshapes) > 0:
+                    for cat in results.face_blendshapes[0]:
+                        blendshapes[cat.category_name] = float(cat.score)
+                return landmarks, blendshapes
+            return None, {}
+        return None, {}
 
     def close(self):
         if self.detector and hasattr(self.detector, "close"):
@@ -532,12 +543,41 @@ class BlinkDetector:
             return 0.0
         return float((v1 + v2) / (2.0 * h))
 
-    def process_eyes(self, left_ear: float, right_ear: float) -> Tuple[Optional[str], Dict[str, Any]]:
+    def process_eyes(
+        self,
+        left_ear: float,
+        right_ear: float,
+        blendshapes: Optional[Dict[str, float]] = None
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
         action = None
-        rearm_threshold = self.config.EAR_THRESHOLD + self.config.EAR_HYSTERESIS_OFFSET
+        signal_source = "ear"
+        left_score = 0.0
+        right_score = 0.0
 
-        left_is_closed = left_ear < self.config.EAR_THRESHOLD
-        right_is_closed = right_ear < self.config.EAR_THRESHOLD
+        use_neural = (
+            getattr(self.config, "USE_NEURAL_BLENDSHAPES", True)
+            and blendshapes is not None
+            and "eyeBlinkLeft" in blendshapes
+            and "eyeBlinkRight" in blendshapes
+        )
+
+        if use_neural:
+            signal_source = "neural_blendshape"
+            left_score = blendshapes["eyeBlinkLeft"]
+            right_score = blendshapes["eyeBlinkRight"]
+            thresh = getattr(self.config, "BLENDSHAPE_BLINK_THRESHOLD", 0.45)
+            rearm_thresh = max(0.10, thresh - 0.20)
+
+            left_is_closed = (left_score >= thresh)
+            right_is_closed = (right_score >= thresh)
+            left_rearmed = (left_score <= rearm_thresh)
+            right_rearmed = (right_score <= rearm_thresh)
+        else:
+            rearm_threshold = self.config.EAR_THRESHOLD + self.config.EAR_HYSTERESIS_OFFSET
+            left_is_closed = left_ear < self.config.EAR_THRESHOLD
+            right_is_closed = right_ear < self.config.EAR_THRESHOLD
+            left_rearmed = (left_ear >= rearm_threshold)
+            right_rearmed = (right_ear >= rearm_threshold)
 
         # Anti-Midas 1: Involuntary Bilateral Blink Suppression
         if self.config.SUPPRESS_BILATERAL_BLINKS and left_is_closed and right_is_closed:
@@ -545,6 +585,8 @@ class BlinkDetector:
             self.right_closed_frames = 0
             return None, {
                 "left_ear": left_ear, "right_ear": right_ear,
+                "left_score": left_score, "right_score": right_score,
+                "signal_source": signal_source,
                 "left_frames": 0, "right_frames": 0,
                 "bilateral_blink": True
             }
@@ -555,7 +597,7 @@ class BlinkDetector:
             if self.left_closed_frames >= self.config.CONSECUTIVE_FRAMES_TRIGGER and not self.left_click_latched:
                 action = "left_click"
                 self.left_click_latched = True
-        elif left_ear >= rearm_threshold:
+        elif left_rearmed:
             self.left_closed_frames = 0
             self.left_click_latched = False
 
@@ -565,13 +607,16 @@ class BlinkDetector:
             if self.right_closed_frames >= self.config.CONSECUTIVE_FRAMES_TRIGGER and not self.right_click_latched:
                 action = "right_click"
                 self.right_click_latched = True
-        elif right_ear >= rearm_threshold:
+        elif right_rearmed:
             self.right_closed_frames = 0
             self.right_click_latched = False
 
         telemetry = {
             "left_ear": left_ear,
             "right_ear": right_ear,
+            "left_score": left_score,
+            "right_score": right_score,
+            "signal_source": signal_source,
             "left_frames": self.left_closed_frames,
             "right_frames": self.right_closed_frames,
             "bilateral_blink": False
@@ -606,6 +651,35 @@ class DualMonitorGazeEstimator:
         self._buf_iris_y = deque(maxlen=3)
         self._buf_yaw = deque(maxlen=3)
         self._buf_pitch = deque(maxlen=3)
+
+        # Depth & Posture normalization via 3D Inter-Ocular Distance (IOD)
+        from gaze_calibration import PostureNormalizer, PolynomialRidgeModel
+        self.normalizer = PostureNormalizer()
+        self.calib_model: Optional[PolynomialRidgeModel] = None
+        self.current_features: List[float] = [0.5, 0.5, 0.5, 0.5, 1.0, 1.0]
+        self.load_calibration_profile()
+
+    def load_calibration_profile(self, filepath: Optional[str] = None) -> bool:
+        """Loads Degree-2 Polynomial Ridge calibration profile from disk."""
+        path = filepath or getattr(self.config, "CALIBRATION_PROFILE_PATH", "calibration_profile.json")
+        if os.path.exists(path):
+            try:
+                from gaze_calibration import PolynomialRidgeModel
+                self.calib_model = PolynomialRidgeModel.load_profile(path)
+                base_iod = self.calib_model.metadata.get("baseline_iod")
+                if base_iod:
+                    self.normalizer.set_baseline(base_iod)
+                print(f"[Gaze Estimator] Loaded calibrated Polynomial Ridge profile from '{path}'.")
+                return True
+            except Exception as e:
+                print(f"[Gaze Estimator] Warning: Failed to load calibration profile: {e}")
+                self.calib_model = None
+        return False
+
+    @property
+    def is_calibrated(self) -> bool:
+        """Returns True if the Degree-2 Polynomial model is active and calibrated."""
+        return self.calib_model is not None and self.calib_model.is_calibrated
 
     def calibrate(self, iris_x: float, iris_y: float, yaw: float, pitch: float):
         """Sets current forward gaze as the resting center of the anchor monitor."""
@@ -687,6 +761,14 @@ class DualMonitorGazeEstimator:
         med_yaw = float(np.median(self._buf_yaw))
         med_pitch = float(np.median(self._buf_pitch))
 
+        # Compute 3D IOD depth scaling and pupil aspect ratio
+        iod = self.normalizer.compute_iod(landmarks, w_img, h_img)
+        depth_scale = self.normalizer.get_depth_scale(iod)
+        r_w = max(abs(r_outer[0] - r_inner[0]), 1e-4)
+        l_w = max(abs(l_outer[0] - l_inner[0]), 1e-4)
+        pupil_aspect = float(r_w / l_w)
+        self.current_features = [med_iris_x, med_iris_y, med_yaw, med_pitch, depth_scale, pupil_aspect]
+
         # Auto-calibrate baseline on startup after collecting 10 steady samples
         if self.calib_iris_x is None:
             self._calib_samples.append((med_iris_x, med_iris_y, med_yaw, med_pitch))
@@ -709,9 +791,26 @@ class DualMonitorGazeEstimator:
     ) -> Tuple[int, int, MonitorInfo]:
         """
         Maps fused gaze coordinates across both monitors.
-        Returns: (screen_x, screen_y, active_monitor_info)
+        Uses calibrated Degree-2 Polynomial Ridge model if available,
+        otherwise falls back to linear head-pose assisted heuristic.
         """
-        # Baseline reference points
+        if self.is_calibrated and getattr(self.config, "USE_POLYNOMIAL_CALIBRATION", True):
+            preds = self.calib_model.predict(np.array(self.current_features))
+            screen_x = int(round(preds[0, 0]))
+            screen_y = int(round(preds[0, 1]))
+
+            # Clamp within full virtual desktop width & height
+            v_min_x = self.display.virtual_left
+            v_max_x = self.display.virtual_left + self.display.virtual_width - 1
+            v_min_y = self.display.virtual_top
+            v_max_y = self.display.virtual_top + self.display.virtual_height - 1
+            screen_x = max(v_min_x, min(v_max_x, screen_x))
+            screen_y = max(v_min_y, min(v_max_y, screen_y))
+
+            active_monitor = self.display.get_monitor_for_x(screen_x)
+            return screen_x, screen_y, active_monitor
+
+        # Baseline reference points (Heuristic Fallback)
         c_ix = self.calib_iris_x if self.calib_iris_x is not None else 0.5
         c_iy = self.calib_iris_y if self.calib_iris_y is not None else 0.5
         c_yaw = self.calib_yaw if self.calib_yaw is not None else 0.5
@@ -735,8 +834,6 @@ class DualMonitorGazeEstimator:
         scaled_dy = total_dy * self.config.SENSITIVITY_Y
 
         # Multi-Monitor Horizontal Mapping:
-        # Camera is on the RIGHT monitor. Resting forward gaze is anchor_monitor.center_x.
-        # Turning/glancing left produces negative scaled_dx, gliding across seam into LEFT monitor.
         anchor = self.anchor_monitor
         screen_x = int(round(anchor.center_x + scaled_dx * anchor.width))
 
@@ -841,9 +938,9 @@ class EyeTrackingMouse:
 
         # Status Overlay Card (Expanded for stability metrics)
         overlay = frame.copy()
-        cv2.rectangle(overlay, (10, 10), (385, 205), (15, 20, 26), -1)
+        cv2.rectangle(overlay, (10, 10), (395, 235), (15, 20, 26), -1)
         cv2.addWeighted(overlay, 0.80, frame, 0.20, 0, frame)
-        cv2.rectangle(frame, (10, 10), (385, 205), (60, 75, 90), 1)
+        cv2.rectangle(frame, (10, 10), (395, 235), (60, 75, 90), 1)
 
         mode_str = "ACTIVE" if self.config.ENABLE_MOUSE_CONTROL else "PREVIEW ONLY"
         mode_col = (0, 255, 180) if self.config.ENABLE_MOUSE_CONTROL else (100, 180, 255)
@@ -853,43 +950,65 @@ class EyeTrackingMouse:
         # Active Monitor Badge
         mon_color = (0, 255, 255) if active_mon.name == "RIGHT" else (255, 180, 0)
         cv2.putText(frame, f"Active Display: [{active_mon.name} MONITOR] ({active_mon.width}x{active_mon.height})",
-                    (20, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.40, mon_color, 1, cv2.LINE_AA)
+                    (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.38, mon_color, 1, cv2.LINE_AA)
+
+        # Gaze Model State
+        is_cal = self.gaze_estimator.is_calibrated
+        engine_label = "DEGREE-2 RIDGE [CALIBRATED]" if is_cal else "HEURISTIC [PRESS 'K']"
+        engine_col = (0, 255, 120) if is_cal else (0, 180, 255)
+        cv2.putText(frame, f"Gaze Engine: {engine_label}", (20, 68),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, engine_col, 1, cv2.LINE_AA)
 
         # Cursor Virtual Position
-        cv2.putText(frame, f"Virtual Cursor: ({cursor_coords[0]}, {cursor_coords[1]})", (20, 72),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220, 220, 220), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"Virtual Cursor: ({cursor_coords[0]}, {cursor_coords[1]})", (20, 86),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (220, 220, 220), 1, cv2.LINE_AA)
 
-        # EAR Gauges
-        l_ear = telemetry.get("left_ear", 0.0)
+        # Blink Gauges (Neural Blendshape or EAR)
+        sig_src = telemetry.get("signal_source", "ear")
         l_frames = telemetry.get("left_frames", 0)
-        l_col = (0, 0, 255) if l_ear < self.config.EAR_THRESHOLD else (0, 255, 0)
-        cv2.putText(frame, f"L-Eye EAR: {l_ear:.3f} [{l_frames}/{self.config.CONSECUTIVE_FRAMES_TRIGGER}] (Left Click)",
-                    (20, 94), cv2.FONT_HERSHEY_SIMPLEX, 0.38, l_col, 1, cv2.LINE_AA)
-
-        r_ear = telemetry.get("right_ear", 0.0)
         r_frames = telemetry.get("right_frames", 0)
-        r_col = (0, 0, 255) if r_ear < self.config.EAR_THRESHOLD else (0, 255, 0)
-        cv2.putText(frame, f"R-Eye EAR: {r_ear:.3f} [{r_frames}/{self.config.CONSECUTIVE_FRAMES_TRIGGER}] (Right Click)",
-                    (20, 114), cv2.FONT_HERSHEY_SIMPLEX, 0.38, r_col, 1, cv2.LINE_AA)
+
+        if sig_src == "neural_blendshape":
+            l_val = telemetry.get("left_score", 0.0)
+            r_val = telemetry.get("right_score", 0.0)
+            thresh = getattr(self.config, "BLENDSHAPE_BLINK_THRESHOLD", 0.45)
+            l_col = (0, 0, 255) if l_val >= thresh else (0, 255, 0)
+            r_col = (0, 0, 255) if r_val >= thresh else (0, 255, 0)
+            cv2.putText(frame, f"L-Eye Neural: {l_val:.2f} [{l_frames}/{self.config.CONSECUTIVE_FRAMES_TRIGGER}] (Left Click)",
+                        (20, 106), cv2.FONT_HERSHEY_SIMPLEX, 0.36, l_col, 1, cv2.LINE_AA)
+            cv2.putText(frame, f"R-Eye Neural: {r_val:.2f} [{r_frames}/{self.config.CONSECUTIVE_FRAMES_TRIGGER}] (Right Click)",
+                        (20, 124), cv2.FONT_HERSHEY_SIMPLEX, 0.36, r_col, 1, cv2.LINE_AA)
+        else:
+            l_ear = telemetry.get("left_ear", 0.0)
+            r_ear = telemetry.get("right_ear", 0.0)
+            l_col = (0, 0, 255) if l_ear < self.config.EAR_THRESHOLD else (0, 255, 0)
+            r_col = (0, 0, 255) if r_ear < self.config.EAR_THRESHOLD else (0, 255, 0)
+            cv2.putText(frame, f"L-Eye EAR: {l_ear:.3f} [{l_frames}/{self.config.CONSECUTIVE_FRAMES_TRIGGER}] (Left Click)",
+                        (20, 106), cv2.FONT_HERSHEY_SIMPLEX, 0.36, l_col, 1, cv2.LINE_AA)
+            cv2.putText(frame, f"R-Eye EAR: {r_ear:.3f} [{r_frames}/{self.config.CONSECUTIVE_FRAMES_TRIGGER}] (Right Click)",
+                        (20, 124), cv2.FONT_HERSHEY_SIMPLEX, 0.36, r_col, 1, cv2.LINE_AA)
 
         # Stability & Fixation Lock State
         fix_str = "FIXATION LOCKED" if self.stabilizer.is_fixating else "TRACKING"
         fix_col = (0, 255, 120) if self.stabilizer.is_fixating else (255, 200, 0)
         cv2.putText(frame, f"Stability: [{self.stabilizer.preset}] ({self.stabilizer.deadzone:.0f}px) - {fix_str}",
-                    (20, 136), cv2.FONT_HERSHEY_SIMPLEX, 0.38, fix_col, 1, cv2.LINE_AA)
+                    (20, 144), cv2.FONT_HERSHEY_SIMPLEX, 0.36, fix_col, 1, cv2.LINE_AA)
 
-        # Dual Monitor Map representation & Axis Direction
+        # Posture & Depth Normalization Ratio
+        depth_s = self.gaze_estimator.current_features[4] if len(self.gaze_estimator.current_features) > 4 else 1.0
         axis_str = "INVERTED" if self.config.INVERT_X else "NATURAL"
-        cv2.putText(frame, f"Cam: RIGHT | Head Yaw: {'ON' if self.config.HEAD_POSE_ASSIST else 'OFF'} | Axis: {axis_str}",
-                    (20, 156), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (170, 190, 200), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"Depth Scale: {depth_s:.2f}x | Cam: RIGHT | Head Yaw: {'ON' if self.config.HEAD_POSE_ASSIST else 'OFF'} | {axis_str}",
+                    (20, 164), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (170, 190, 200), 1, cv2.LINE_AA)
 
         # Action or Hotkeys
         if time.time() - self.last_action_timestamp < 0.6:
-            cv2.putText(frame, f"** {self.last_action_text} TRIGGERED **", (20, 185),
+            cv2.putText(frame, f"** {self.last_action_text} TRIGGERED **", (20, 190),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 255), 2, cv2.LINE_AA)
         else:
-            cv2.putText(frame, "Hotkeys: [S] Mode | [+/-] Deadzone | [C] Center | [I] Invert | [Q] Quit",
-                        (20, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.30, (140, 150, 160), 1, cv2.LINE_AA)
+            cv2.putText(frame, "Hotkeys: [K] Calibrate (9-Pt) | [E] Eval | [S] Preset | [C] Center | [Q] Quit",
+                        (20, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.30, (140, 150, 160), 1, cv2.LINE_AA)
+            cv2.putText(frame, "[1/2] Snap Mon | [+/-] Deadzone | [I] Invert | [M] Mouse On/Off",
+                        (20, 208), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (120, 130, 140), 1, cv2.LINE_AA)
 
     def run(self):
         """Starts real-time dual-monitor eye tracking capture loop."""
@@ -910,7 +1029,9 @@ class EyeTrackingMouse:
         print(f"EAR Threshold:          {self.config.EAR_THRESHOLD:.2f} (Eye Closed Detection)")
         print("-" * 80)
         print("Controls & Hotkeys:")
-        print("  • Look at Right Monitor Center + Press 'c' -> Calibrate Resting Center")
+        print("  • Press 'k'                                -> Interactive 9-Point Calibration Wizard (Degree-2 Ridge)")
+        print("  • Press 'e'                                -> Ground-Truth Accuracy Benchmark Harness")
+        print("  • Look at Right Monitor Center + Press 'c' -> Calibrate Resting Center (Heuristic Fallback)")
         print("  • Press 's'                                -> Cycle Stability: SMOOTH -> ULTRA-STABLE -> RESPONSIVE")
         print("  • Press '+' or '='                         -> Increase Fixation Deadzone (+1 px)")
         print("  • Press '-' or '_'                         -> Decrease Fixation Deadzone (-1 px)")
@@ -948,7 +1069,8 @@ class EyeTrackingMouse:
                     frame = cv2.flip(frame, 1)
 
                 h, w, _ = frame.shape
-                face_landmarks = self.mesh_adapter.process(frame)
+                res = self.mesh_adapter.process(frame)
+                face_landmarks, blendshapes = res if isinstance(res, tuple) else (res, {})
 
                 cursor_x = self.display.get_anchor_monitor().center_x
                 cursor_y = self.display.get_anchor_monitor().center_y
@@ -957,24 +1079,24 @@ class EyeTrackingMouse:
                 ix, iy, yaw, pitch = 0.5, 0.5, 0.5, 0.5
 
                 if face_landmarks:
-                    # 1. Blink Detection via 6-Point EAR
+                    # 1. Blink Detection via Neural Blendshapes (with 6-Point EAR fallback)
                     left_pts = self._extract_ear_landmarks(face_landmarks, Landmarks.LEFT_EYE_EAR, w, h)
                     right_pts = self._extract_ear_landmarks(face_landmarks, Landmarks.RIGHT_EYE_EAR, w, h)
 
                     left_ear = self.blink_detector.calculate_ear(left_pts)
                     right_ear = self.blink_detector.calculate_ear(right_pts)
 
-                    action, telemetry = self.blink_detector.process_eyes(left_ear, right_ear)
+                    action, telemetry = self.blink_detector.process_eyes(left_ear, right_ear, blendshapes=blendshapes)
                     if action:
                         self.last_action_text = action.upper().replace("_", " ")
                         self.last_action_timestamp = time.time()
                         self._execute_mouse_action(action)
 
-                    # 2. Dual-Monitor Gaze & Head Pose Estimation
+                    # 2. Dual-Monitor Gaze & Head Pose Estimation (Calibrated Ridge or Heuristic)
                     ix, iy, yaw, pitch = self.gaze_estimator.estimate_gaze(face_landmarks, (h, w))
                     raw_x, raw_y, active_mon = self.gaze_estimator.map_to_screen(ix, iy, yaw, pitch)
 
-                    # 3. Jitter Reduction: EMA + Deadzone
+                    # 3. Jitter Reduction: 1-Euro Adaptive Filter + Fixation Lock Deadzone
                     cursor_x, cursor_y = self.filter.update(raw_x, raw_y)
 
                     # 4. Native Multi-Monitor Cursor Actuation
@@ -995,6 +1117,31 @@ class EyeTrackingMouse:
                 if key in [ord('q'), 27]:
                     print("\n[INFO] User exit requested. Shutting down.")
                     break
+                elif key == ord('k'):
+                    print("\n[KEY 'K'] Launching Interactive 9-Point Calibration Wizard...")
+                    from gaze_calibration import CalibrationWizard
+                    wizard = CalibrationWizard(
+                        display_manager=self.display,
+                        mesh_adapter=self.mesh_adapter,
+                        posture_normalizer=self.gaze_estimator.normalizer,
+                        config=self.config,
+                        output_profile_path=self.config.CALIBRATION_PROFILE_PATH
+                    )
+                    model = wizard.run_calibration(cap)
+                    if model:
+                        self.gaze_estimator.calib_model = model
+                        self.stabilizer.reset()
+                        print("[KEY 'K'] Calibration successfully applied and active!")
+                elif key == ord('e'):
+                    print("\n[KEY 'E'] Launching Ground-Truth Accuracy Benchmark Harness...")
+                    from evaluate_accuracy import AccuracyEvaluator
+                    evaluator = AccuracyEvaluator(
+                        config=self.config,
+                        force_baseline=not self.gaze_estimator.is_calibrated,
+                        profile_path=self.config.CALIBRATION_PROFILE_PATH
+                    )
+                    evaluator.run_benchmark(cap)
+                    self.stabilizer.reset()
                 elif key == ord('m'):
                     self.config.ENABLE_MOUSE_CONTROL = not self.config.ENABLE_MOUSE_CONTROL
                     state = "ACTIVE" if self.config.ENABLE_MOUSE_CONTROL else "DISABLED"
