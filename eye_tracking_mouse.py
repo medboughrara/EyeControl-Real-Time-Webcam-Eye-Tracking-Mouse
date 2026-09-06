@@ -120,6 +120,18 @@ class EyeTrackerConfig:
     BLENDSHAPE_BLINK_THRESHOLD: float = 0.45 # Probability threshold for deliberate wink (0.0 to 1.0)
     USE_POLYNOMIAL_CALIBRATION: bool = True # Use Degree-2 Polynomial Ridge Model when calibrated
     CALIBRATION_PROFILE_PATH: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration_profile.json")
+
+    # --------------------------------------------------------------------------
+    # Ergonomics: Hands-Free Dwell Clicking & Edge Scrolling
+    # --------------------------------------------------------------------------
+    ENABLE_DWELL_CLICK: bool = True          # Hands-free click on sustained target fixation
+    DWELL_TIME_SECONDS: float = 0.75         # Target hover duration before click triggers
+    DWELL_RADIUS_PIXELS: float = 28.0        # Max drift radius during fixation lock
+    DWELL_COOLDOWN_SECONDS: float = 0.60     # Post-click cooldown before next dwell can arm
+    ENABLE_EDGE_SCROLL: bool = True          # Smooth document scroll when looking at top/bottom border
+    EDGE_SCROLL_SPEED: int = 40              # Scroll intensity pulse (wheel delta)
+    EDGE_SCROLL_INTERVAL: float = 0.12       # Seconds between continuous scroll pulses
+
     ENABLE_MOUSE_CONTROL: bool = True       # True = physically move cursor; False = preview HUD
     SHOW_DEBUG_HUD: bool = True             # Overlay real-time EAR meters and active monitor indicator
     MODEL_TASK_PATH: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "face_landmarker.task")  # MediaPipe vision model bundle path
@@ -265,6 +277,20 @@ class MouseController:
         elif PYAUTOGUI_AVAILABLE:
             pyautogui.click(button=button)
 
+    def scroll(self, delta: int):
+        """
+        Sends hardware-level mouse wheel scroll pulse.
+        delta > 0 scrolls UP, delta < 0 scrolls DOWN.
+        """
+        if self.is_windows:
+            # MOUSEEVENTF_WHEEL = 0x0800
+            self.user32.mouse_event(0x0800, 0, 0, int(delta), 0)
+        elif PYAUTOGUI_AVAILABLE:
+            try:
+                pyautogui.scroll(int(delta))
+            except Exception:
+                pass
+
 
 # ==============================================================================
 # 4. MEDIAPIPE FACE MESH LANDMARK CONSTANTS
@@ -336,14 +362,14 @@ class FaceMeshAdapter:
         else:
             raise RuntimeError("Incompatible MediaPipe version.")
 
-    def process(self, frame_bgr: np.ndarray) -> Tuple[Optional[List[Any]], Dict[str, float]]:
-        """Runs face mesh inference and returns (478 normalized landmarks, blendshapes_dict)."""
+    def process(self, frame_bgr: np.ndarray) -> Tuple[Optional[List[Any]], Dict[str, float], Optional[np.ndarray]]:
+        """Runs face mesh inference and returns (478 normalized landmarks, blendshapes_dict, 4x4 metric 3D matrix)."""
         rgb_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         if self.mode == "solutions":
             results = self.detector.process(rgb_frame)
             if results.multi_face_landmarks:
-                return results.multi_face_landmarks[0].landmark, {}
-            return None, {}
+                return results.multi_face_landmarks[0].landmark, {}, None
+            return None, {}, None
         elif self.mode == "tasks":
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
             results = self.detector.detect(mp_image)
@@ -353,9 +379,12 @@ class FaceMeshAdapter:
                 if results.face_blendshapes and len(results.face_blendshapes) > 0:
                     for cat in results.face_blendshapes[0]:
                         blendshapes[cat.category_name] = float(cat.score)
-                return landmarks, blendshapes
-            return None, {}
-        return None, {}
+                matrix_3d = None
+                if results.facial_transformation_matrixes and len(results.facial_transformation_matrixes) > 0:
+                    matrix_3d = np.array(results.facial_transformation_matrixes[0].data, dtype=np.float32).reshape((4, 4))
+                return landmarks, blendshapes, matrix_3d
+            return None, {}, None
+        return None, {}, None
 
     def close(self):
         if self.detector and hasattr(self.detector, "close"):
@@ -506,6 +535,17 @@ class AdaptiveStabilizer:
             self.locked_y = smooth_y
             return int(round(smooth_x)), int(round(smooth_y))
 
+    def on_saccade(self, x: float, y: float):
+        """
+        Instantly resets filter state to new coordinates on saccadic jump,
+        completely eliminating trailing drag across monitors.
+        """
+        self.fx.x_prev = float(x)
+        self.fy.x_prev = float(y)
+        self.locked_x = float(x)
+        self.locked_y = float(y)
+        self.is_fixating = False
+
     def reset(self):
         """Clears filter state."""
         self.fx.reset()
@@ -520,7 +560,139 @@ EMAFilter = AdaptiveStabilizer
 
 
 # ==============================================================================
-# 7. BLINK & CLICK DETECTOR (EAR STATE MACHINE)
+# 7. I-VT (VELOCITY-THRESHOLD IDENTIFICATION) EYE MOVEMENT CLASSIFIER
+# ==============================================================================
+class IVTClassifier:
+    """
+    Salvucci & Goldberg (2000) I-VT Classifier.
+    Classifies continuous gaze velocity into:
+      - SACCADE: High-velocity eye movement (> 1200 px/s)
+      - FIXATION: Low-velocity stable gaze (< 300 px/s)
+      - PURSUIT: Moderate velocity smooth pursuit
+    """
+    def __init__(self, saccade_threshold_px_s: float = 1200.0, fixation_threshold_px_s: float = 300.0):
+        self.saccade_threshold = float(saccade_threshold_px_s)
+        self.fixation_threshold = float(fixation_threshold_px_s)
+        self.prev_x: Optional[float] = None
+        self.prev_y: Optional[float] = None
+        self.prev_time: Optional[float] = None
+        self.current_state: str = "FIXATION"
+        self.current_velocity: float = 0.0
+
+    def update(self, x: float, y: float, t: Optional[float] = None) -> str:
+        if t is None:
+            t = time.time()
+        if self.prev_x is None or self.prev_time is None:
+            self.prev_x = float(x)
+            self.prev_y = float(y)
+            self.prev_time = t
+            self.current_state = "FIXATION"
+            self.current_velocity = 0.0
+            return self.current_state
+
+        dt = max(t - self.prev_time, 1e-4)
+        dist = math.hypot(x - self.prev_x, y - self.prev_y)
+        velocity = dist / dt  # px / sec
+        self.current_velocity = velocity
+
+        if velocity >= self.saccade_threshold:
+            self.current_state = "SACCADE"
+        elif velocity <= self.fixation_threshold:
+            self.current_state = "FIXATION"
+        else:
+            self.current_state = "PURSUIT"
+
+        self.prev_x = float(x)
+        self.prev_y = float(y)
+        self.prev_time = t
+        return self.current_state
+
+    def reset(self):
+        self.prev_x = None
+        self.prev_y = None
+        self.prev_time = None
+        self.current_state = "FIXATION"
+        self.current_velocity = 0.0
+
+
+# ==============================================================================
+# 8. HANDS-FREE DWELL CLICKING ENGINE
+# ==============================================================================
+class DwellClickEngine:
+    """
+    Hands-free target dwell clicker.
+    When gaze fixates steadily on a target for dwell_time seconds,
+    triggers a click and initiates a cooldown.
+    """
+    def __init__(
+        self,
+        dwell_time: float = 0.75,
+        dwell_radius: float = 28.0,
+        cooldown_time: float = 0.60
+    ):
+        self.dwell_time = float(dwell_time)
+        self.dwell_radius = float(dwell_radius)
+        self.cooldown_time = float(cooldown_time)
+
+        self.anchor_x: Optional[float] = None
+        self.anchor_y: Optional[float] = None
+        self.fixation_start_time: Optional[float] = None
+        self.last_click_time: float = 0.0
+        self.is_latched: bool = False
+
+    def update(self, x: float, y: float, is_fixating: bool, t: Optional[float] = None) -> Tuple[bool, float]:
+        """
+        Returns (did_click, progress_ratio).
+        progress_ratio (0.0 to 1.0) is used to draw circular countdown animation.
+        """
+        if t is None:
+            t = time.time()
+
+        # Cooldown guard
+        if t - self.last_click_time < self.cooldown_time:
+            self.reset()
+            return False, 0.0
+
+        if not is_fixating:
+            self.reset()
+            return False, 0.0
+
+        if self.anchor_x is None or self.anchor_y is None or self.fixation_start_time is None:
+            self.anchor_x = float(x)
+            self.anchor_y = float(y)
+            self.fixation_start_time = t
+            self.is_latched = False
+            return False, 0.0
+
+        disp = math.hypot(x - self.anchor_x, y - self.anchor_y)
+        if disp > self.dwell_radius:
+            # Gaze drifted outside dwell radius: re-anchor
+            self.anchor_x = float(x)
+            self.anchor_y = float(y)
+            self.fixation_start_time = t
+            self.is_latched = False
+            return False, 0.0
+
+        elapsed = t - self.fixation_start_time
+        progress = min(elapsed / self.dwell_time, 1.0)
+
+        if progress >= 1.0 and not self.is_latched:
+            self.is_latched = True
+            self.last_click_time = t
+            self.reset()
+            return True, 1.0
+
+        return False, progress
+
+    def reset(self):
+        self.anchor_x = None
+        self.anchor_y = None
+        self.fixation_start_time = None
+        self.is_latched = False
+
+
+# ==============================================================================
+# 9. BLINK & CLICK DETECTOR (EAR & NEURAL BLENDSHAPE ENGINE)
 # ==============================================================================
 class BlinkDetector:
     """Computes Eye Aspect Ratio (EAR) with anti-Midas guardrails."""
@@ -693,10 +865,12 @@ class DualMonitorGazeEstimator:
     def estimate_gaze(
         self,
         landmarks: Any,
-        frame_shape: Tuple[int, int]
+        frame_shape: Tuple[int, int],
+        matrix_3d: Optional[np.ndarray] = None
     ) -> Tuple[float, float, float, float]:
         """
         Calculates normalized iris gaze and facial head yaw/pitch with temporal median smoothing.
+        Supports true 3D metric Euler angles when matrix_3d is available from MediaPipe.
         Returns: (iris_x, iris_y, head_yaw, head_pitch)
         """
         h_img, w_img = frame_shape
@@ -728,18 +902,31 @@ class DualMonitorGazeEstimator:
         avg_iris_x = float((r_norm_x + l_norm_x) / 2.0)
         avg_iris_y = float((r_norm_y + l_norm_y) / 2.0)
 
-        # 3. Head Pose (Nose vs. Cheek Edges)
-        nose = get_xy(Landmarks.NOSE_TIP)
-        f_left = get_xy(Landmarks.FACE_RIGHT_CHEEK)
-        f_right = get_xy(Landmarks.FACE_LEFT_CHEEK)
-        f_top = get_xy(Landmarks.FOREHEAD)
-        f_bot = get_xy(Landmarks.CHIN)
+        # 3. Head Pose (True 3D Metric Transformation Matrix or 2D Geometric Fallback)
+        if matrix_3d is not None and isinstance(matrix_3d, np.ndarray) and matrix_3d.shape == (4, 4):
+            R = matrix_3d[0:3, 0:3]
+            sy = math.sqrt(R[0, 0] * R[0, 0] + R[1, 0] * R[1, 0])
+            if sy > 1e-6:
+                pitch_rad = math.atan2(R[2, 1], R[2, 2])
+                yaw_rad = math.atan2(-R[2, 0], sy)
+            else:
+                pitch_rad = math.atan2(-R[1, 2], R[1, 1])
+                yaw_rad = math.atan2(-R[2, 0], sy)
+            # Center around 0.5 with scaling factor mapping ~ +/- 30 deg (~0.52 rad) to +/- 0.5
+            head_yaw = float(np.clip(0.5 + yaw_rad, 0.0, 1.0))
+            head_pitch = float(np.clip(0.5 + pitch_rad, 0.0, 1.0))
+        else:
+            nose = get_xy(Landmarks.NOSE_TIP)
+            f_left = get_xy(Landmarks.FACE_RIGHT_CHEEK)
+            f_right = get_xy(Landmarks.FACE_LEFT_CHEEK)
+            f_top = get_xy(Landmarks.FOREHEAD)
+            f_bot = get_xy(Landmarks.CHIN)
 
-        face_w = max(abs(f_right[0] - f_left[0]), 1e-4)
-        face_h = max(abs(f_bot[1] - f_top[1]), 1e-4)
+            face_w = max(abs(f_right[0] - f_left[0]), 1e-4)
+            face_h = max(abs(f_bot[1] - f_top[1]), 1e-4)
 
-        head_yaw = float((nose[0] - min(f_left[0], f_right[0])) / face_w)
-        head_pitch = float((nose[1] - f_top[1]) / face_h)
+            head_yaw = float((nose[0] - min(f_left[0], f_right[0])) / face_w)
+            head_pitch = float((nose[1] - f_top[1]) / face_h)
 
         # Direction alignment:
         if self.config.INVERT_X:
@@ -877,6 +1064,17 @@ class EyeTrackingMouse:
         self.gaze_estimator = DualMonitorGazeEstimator(self.config, self.display)
         self.mesh_adapter = FaceMeshAdapter(model_asset_path=self.config.MODEL_TASK_PATH)
 
+        # Ergonomics: I-VT Movement Classifier & Hands-Free Dwell Clicker
+        self.ivt = IVTClassifier(saccade_threshold_px_s=1200.0, fixation_threshold_px_s=300.0)
+        self.dwell = DwellClickEngine(
+            dwell_time=self.config.DWELL_TIME_SECONDS,
+            dwell_radius=self.config.DWELL_RADIUS_PIXELS,
+            cooldown_time=self.config.DWELL_COOLDOWN_SECONDS
+        )
+        self.dwell_progress = 0.0
+        self.ivt_state = "FIXATION"
+        self._last_scroll_time = 0.0
+
         # Telemetry
         self.last_action_text = "Idle"
         self.last_action_timestamp = 0.0
@@ -894,6 +1092,26 @@ class EyeTrackingMouse:
             self.mouse.click(button="left")
         elif action == "right_click":
             self.mouse.click(button="right")
+
+    def _check_edge_scroll(self, cursor_y: int, active_mon: MonitorInfo, t: float):
+        """Smoothly scrolls active window when gaze fixates on top or bottom monitor borders."""
+        if not self.config.ENABLE_EDGE_SCROLL or not self.config.ENABLE_MOUSE_CONTROL:
+            return
+        top_threshold = active_mon.top + int(active_mon.height * 0.035)
+        bottom_threshold = active_mon.bottom - int(active_mon.height * 0.035)
+
+        if cursor_y <= top_threshold:
+            if t - self._last_scroll_time >= self.config.EDGE_SCROLL_INTERVAL:
+                self.mouse.scroll(+self.config.EDGE_SCROLL_SPEED)
+                self._last_scroll_time = t
+                self.last_action_text = "SCROLL UP"
+                self.last_action_timestamp = t
+        elif cursor_y >= bottom_threshold:
+            if t - self._last_scroll_time >= self.config.EDGE_SCROLL_INTERVAL:
+                self.mouse.scroll(-self.config.EDGE_SCROLL_SPEED)
+                self._last_scroll_time = t
+                self.last_action_text = "SCROLL DOWN"
+                self.last_action_timestamp = t
 
     def _open_camera(self) -> Optional[cv2.VideoCapture]:
         """Auto-detects functional camera device with DirectShow on Windows."""
@@ -936,11 +1154,11 @@ class EyeTrackingMouse:
         draw_pt(Landmarks.RIGHT_IRIS_CENTER, (0, 255, 255), radius=4)
         draw_pt(Landmarks.NOSE_TIP, (0, 165, 255), radius=4)  # Orange nose marker for head yaw
 
-        # Status Overlay Card (Expanded for stability metrics)
+        # Status Overlay Card (Expanded for ergonomic metrics)
         overlay = frame.copy()
-        cv2.rectangle(overlay, (10, 10), (395, 235), (15, 20, 26), -1)
+        cv2.rectangle(overlay, (10, 10), (405, 245), (15, 20, 26), -1)
         cv2.addWeighted(overlay, 0.80, frame, 0.20, 0, frame)
-        cv2.rectangle(frame, (10, 10), (395, 235), (60, 75, 90), 1)
+        cv2.rectangle(frame, (10, 10), (405, 245), (60, 75, 90), 1)
 
         mode_str = "ACTIVE" if self.config.ENABLE_MOUSE_CONTROL else "PREVIEW ONLY"
         mode_col = (0, 255, 180) if self.config.ENABLE_MOUSE_CONTROL else (100, 180, 255)
@@ -988,27 +1206,39 @@ class EyeTrackingMouse:
             cv2.putText(frame, f"R-Eye EAR: {r_ear:.3f} [{r_frames}/{self.config.CONSECUTIVE_FRAMES_TRIGGER}] (Right Click)",
                         (20, 124), cv2.FONT_HERSHEY_SIMPLEX, 0.36, r_col, 1, cv2.LINE_AA)
 
-        # Stability & Fixation Lock State
-        fix_str = "FIXATION LOCKED" if self.stabilizer.is_fixating else "TRACKING"
-        fix_col = (0, 255, 120) if self.stabilizer.is_fixating else (255, 200, 0)
-        cv2.putText(frame, f"Stability: [{self.stabilizer.preset}] ({self.stabilizer.deadzone:.0f}px) - {fix_str}",
-                    (20, 144), cv2.FONT_HERSHEY_SIMPLEX, 0.36, fix_col, 1, cv2.LINE_AA)
+        # I-VT Movement State and Fixation Lock
+        fix_str = "LOCKED" if self.stabilizer.is_fixating else "MOVING"
+        ivt_col = (0, 255, 120) if self.ivt_state == "FIXATION" else ((0, 200, 255) if self.ivt_state == "PURSUIT" else (0, 100, 255))
+        cv2.putText(frame, f"State: [{self.ivt_state}] | Lock: {fix_str} | Preset: {self.stabilizer.preset}",
+                    (20, 144), cv2.FONT_HERSHEY_SIMPLEX, 0.35, ivt_col, 1, cv2.LINE_AA)
+
+        # Ergonomics: Dwell & Edge Scroll
+        dwell_str = f"ON ({int(self.dwell_progress * 100)}%)" if self.config.ENABLE_DWELL_CLICK else "OFF"
+        scroll_str = "ON" if self.config.ENABLE_EDGE_SCROLL else "OFF"
+        cv2.putText(frame, f"Dwell Click: [{dwell_str}] | Edge Scroll: [{scroll_str}]",
+                    (20, 164), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (220, 220, 150), 1, cv2.LINE_AA)
 
         # Posture & Depth Normalization Ratio
         depth_s = self.gaze_estimator.current_features[4] if len(self.gaze_estimator.current_features) > 4 else 1.0
         axis_str = "INVERTED" if self.config.INVERT_X else "NATURAL"
         cv2.putText(frame, f"Depth Scale: {depth_s:.2f}x | Cam: RIGHT | Head Yaw: {'ON' if self.config.HEAD_POSE_ASSIST else 'OFF'} | {axis_str}",
-                    (20, 164), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (170, 190, 200), 1, cv2.LINE_AA)
+                    (20, 184), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (170, 190, 200), 1, cv2.LINE_AA)
+
+        # Dwell Circular Animation in HUD Card
+        if self.config.ENABLE_DWELL_CLICK and self.dwell_progress > 0.0:
+            cv2.circle(frame, (370, 48), 16, (45, 55, 65), 2, cv2.LINE_AA)
+            cv2.ellipse(frame, (370, 48), (16, 16), 0, -90, -90 + int(self.dwell_progress * 360), (0, 255, 120), 3, cv2.LINE_AA)
+            cv2.putText(frame, "DWELL", (353, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 255, 120), 1, cv2.LINE_AA)
 
         # Action or Hotkeys
         if time.time() - self.last_action_timestamp < 0.6:
-            cv2.putText(frame, f"** {self.last_action_text} TRIGGERED **", (20, 190),
+            cv2.putText(frame, f"** {self.last_action_text} TRIGGERED **", (20, 210),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 255), 2, cv2.LINE_AA)
         else:
-            cv2.putText(frame, "Hotkeys: [K] Calibrate (9-Pt) | [E] Eval | [S] Preset | [C] Center | [Q] Quit",
-                        (20, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.30, (140, 150, 160), 1, cv2.LINE_AA)
-            cv2.putText(frame, "[1/2] Snap Mon | [+/-] Deadzone | [I] Invert | [M] Mouse On/Off",
-                        (20, 208), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (120, 130, 140), 1, cv2.LINE_AA)
+            cv2.putText(frame, "Hotkeys: [D] Dwell | [W] Scroll | [K] Calib | [E] Eval | [S] Preset | [Q] Quit",
+                        (20, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.29, (140, 150, 160), 1, cv2.LINE_AA)
+            cv2.putText(frame, "[1/2] Snap Mon | [+/-] Deadzone | [I] Invert | [C] Center | [M] Mouse",
+                        (20, 228), cv2.FONT_HERSHEY_SIMPLEX, 0.27, (120, 130, 140), 1, cv2.LINE_AA)
 
     def run(self):
         """Starts real-time dual-monitor eye tracking capture loop."""
@@ -1029,6 +1259,8 @@ class EyeTrackingMouse:
         print(f"EAR Threshold:          {self.config.EAR_THRESHOLD:.2f} (Eye Closed Detection)")
         print("-" * 80)
         print("Controls & Hotkeys:")
+        print("  • Press 'd'                                -> Toggle Hands-Free Dwell Clicking (Hold 0.75s to click)")
+        print("  • Press 'w'                                -> Toggle Smooth Edge Scrolling (Top/Bottom border hover)")
         print("  • Press 'k'                                -> Interactive 9-Point Calibration Wizard (Degree-2 Ridge)")
         print("  • Press 'e'                                -> Ground-Truth Accuracy Benchmark Harness")
         print("  • Look at Right Monitor Center + Press 'c' -> Calibrate Resting Center (Heuristic Fallback)")
@@ -1070,7 +1302,15 @@ class EyeTrackingMouse:
 
                 h, w, _ = frame.shape
                 res = self.mesh_adapter.process(frame)
-                face_landmarks, blendshapes = res if isinstance(res, tuple) else (res, {})
+                if len(res) == 3:
+                    face_landmarks, blendshapes, matrix_3d = res
+                elif len(res) == 2:
+                    face_landmarks, blendshapes = res
+                    matrix_3d = None
+                else:
+                    face_landmarks = res[0] if res else None
+                    blendshapes = {}
+                    matrix_3d = None
 
                 cursor_x = self.display.get_anchor_monitor().center_x
                 cursor_y = self.display.get_anchor_monitor().center_y
@@ -1092,18 +1332,37 @@ class EyeTrackingMouse:
                         self.last_action_timestamp = time.time()
                         self._execute_mouse_action(action)
 
-                    # 2. Dual-Monitor Gaze & Head Pose Estimation (Calibrated Ridge or Heuristic)
-                    ix, iy, yaw, pitch = self.gaze_estimator.estimate_gaze(face_landmarks, (h, w))
+                    # 2. Dual-Monitor Gaze & Head Pose Estimation (Supports 3D Metric Pose Matrix)
+                    ix, iy, yaw, pitch = self.gaze_estimator.estimate_gaze(face_landmarks, (h, w), matrix_3d=matrix_3d)
                     raw_x, raw_y, active_mon = self.gaze_estimator.map_to_screen(ix, iy, yaw, pitch)
 
-                    # 3. Jitter Reduction: 1-Euro Adaptive Filter + Fixation Lock Deadzone
+                    # 3. I-VT Gaze Movement Classification (Saccade vs Fixation vs Pursuit)
+                    self.ivt_state = self.ivt.update(raw_x, raw_y)
+                    if self.ivt_state == "SACCADE":
+                        self.filter.on_saccade(raw_x, raw_y)
+
+                    # 4. Multi-Stage Cursor Stabilization (1€ Adaptive Filter + Fixation Lock Deadzone)
                     cursor_x, cursor_y = self.filter.update(raw_x, raw_y)
 
-                    # 4. Native Multi-Monitor Cursor Actuation
+                    # 5. Ergonomics: Hands-Free Dwell Clicking
+                    if self.config.ENABLE_DWELL_CLICK and self.config.ENABLE_MOUSE_CONTROL:
+                        is_fix = (self.ivt_state == "FIXATION") or self.stabilizer.is_fixating
+                        did_dwell, self.dwell_progress = self.dwell.update(cursor_x, cursor_y, is_fixating=is_fix)
+                        if did_dwell:
+                            self.last_action_text = "DWELL CLICK"
+                            self.last_action_timestamp = time.time()
+                            self._execute_mouse_action("left_click")
+                    else:
+                        self.dwell_progress = 0.0
+
+                    # 6. Ergonomics: Smooth Edge-Scrolling
+                    self._check_edge_scroll(cursor_y, active_mon, time.time())
+
+                    # 7. Native Multi-Monitor Cursor Actuation
                     if self.config.ENABLE_MOUSE_CONTROL:
                         self.mouse.move(cursor_x, cursor_y)
 
-                    # 5. Render Heads-Up Display
+                    # 8. Render Heads-Up Display
                     if self.config.SHOW_DEBUG_HUD:
                         self._draw_hud(frame, face_landmarks, telemetry, (cursor_x, cursor_y), active_mon)
 
@@ -1117,6 +1376,16 @@ class EyeTrackingMouse:
                 if key in [ord('q'), 27]:
                     print("\n[INFO] User exit requested. Shutting down.")
                     break
+                elif key == ord('d'):
+                    self.config.ENABLE_DWELL_CLICK = not self.config.ENABLE_DWELL_CLICK
+                    state = "ENABLED" if self.config.ENABLE_DWELL_CLICK else "DISABLED"
+                    self.dwell.reset()
+                    self.dwell_progress = 0.0
+                    print(f"[TOGGLE] Hands-Free Dwell Clicking is now: {state}")
+                elif key == ord('w'):
+                    self.config.ENABLE_EDGE_SCROLL = not self.config.ENABLE_EDGE_SCROLL
+                    state = "ENABLED" if self.config.ENABLE_EDGE_SCROLL else "DISABLED"
+                    print(f"[TOGGLE] Smooth Edge Scrolling is now: {state}")
                 elif key == ord('k'):
                     print("\n[KEY 'K'] Launching Interactive 9-Point Calibration Wizard...")
                     from gaze_calibration import CalibrationWizard

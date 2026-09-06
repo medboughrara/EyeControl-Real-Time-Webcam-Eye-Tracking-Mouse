@@ -44,6 +44,25 @@ Human eyes have involuntary physiological tremors (30-80 Hz) and micro-saccades.
 - **Posture & Depth Normalization**: Tracks 3D Inter-Ocular Distance ($d_{IOD} = \|\mathbf{p}_{33} - \mathbf{p}_{263}\|_2$) to compensate for slouching, leaning forward, or distance changes.
 - **Persistent Profile**: Calibration is saved to `calibration_profile.json` so you do not need to re-calibrate on every launch.
 
+### 6. Hands-Free Dwell Clicking
+- **Fixation Anchor Engine**: Fixate on any UI element (button, link, icon) within an 18-pixel radius to start the dwell timer.
+- **Visual Circular Progress Ring**: A smooth circular countdown indicator animates around the cursor / HUD over 750ms.
+- **Anti-Stutter Cooldown**: Includes a 600ms cooldown after actuation to prevent unintended double clicks.
+- **Zero Facial Fatigue**: Users who prefer not to wink can control their PC completely hands-free via gaze dwelling.
+
+### 7. I-VT Eye Movement Classifier (Saccade vs. Fixation)
+- **Velocity-Threshold Identification**: Classifies eye movements in real-time based on angular/pixel velocity:
+  - **Fixation** ($\le 300\text{ px/s}$): Deep low-pass stabilization engaged for rock-solid aiming.
+  - **Saccade** ($\ge 1200\text{ px/s}$): Instantly bypasses filter latency, snapping the cursor to the target with zero drag.
+  - **Pursuit** ($300 - 1200\text{ px/s}$): Adaptive smoothing for fluid visual tracking.
+
+### 8. Smooth Gaze Edge-Scrolling
+- **Border Proximity Detection**: Looking at the extreme top (upper 6%) or bottom (lower 6%) of either display automatically triggers document/webpage scrolling.
+- **Native OS Wheel Actuation**: Dispatches high-precision Windows native `MOUSEEVENTF_WHEEL` events without requiring third-party drivers.
+
+### 9. 3D Metric Head Pose (Facial Transformation Matrix)
+- Uses MediaPipe's $4 \times 4$ rigid transformation matrix ($SE(3)$) from the canonical metric face model to extract true Euler angles (Yaw, Pitch, Roll in radians/degrees) rather than 2D approximations.
+
 ---
 
 ## Controls & Hotkeys
@@ -51,6 +70,8 @@ Human eyes have involuntary physiological tremors (30-80 Hz) and micro-saccades.
 | Key / Action | Function |
 | :--- | :--- |
 | **Look around** | Cursor glides across both displays following eyes and head. |
+| `d` | **Toggle Hands-Free Dwell Clicking**: Hover for 0.75s to click without winking. |
+| `w` | **Toggle Smooth Edge Scrolling**: Hover near top/bottom screen edges to scroll. |
 | `k` | **Interactive 9-Point Calibration Wizard**: Fullscreen targets across monitors to train Degree-2 Ridge Model. |
 | `e` | **Accuracy Benchmark Harness**: Empirical evaluation measuring Mean Radial Error (MRE in pixels). |
 | `c` | **Re-Center Calibration**: Look at the camera/center of right monitor and press `c` (Heuristic fallback). |
@@ -60,8 +81,8 @@ Human eyes have involuntary physiological tremors (30-80 Hz) and micro-saccades.
 | `i` | **Toggle Invert X-Axis**: Reverses horizontal tracking direction if needed. |
 | `1` | **Snap to Left Monitor Center** (800, 450). |
 | `2` | **Snap to Right Monitor Center** (2368, 338). |
-| **Left Eye Wink** (hold ~0.2s) | **Left Mouse Click**. |
-| **Right Eye Wink** (hold ~0.2s) | **Right Mouse Click**. |
+| **Left Eye Wink** (hold ~0.2s) | **Left Mouse Click** (neural blendshape or EAR). |
+| **Right Eye Wink** (hold ~0.2s) | **Right Mouse Click** (neural blendshape or EAR). |
 | `m` | **Toggle Mouse Control** On / Off (preview mode). |
 | `q` or `ESC` | **Quit** application. |
 
@@ -77,7 +98,8 @@ E:\EyeControl\
   |-- calibration_profile.json  # Persisted calibration weights (auto-generated)
   |-- tests/
   |   |-- test_gaze_calibration.py
-  |   +-- test_tracker_integration.py
+  |   |-- test_tracker_integration.py
+  |   +-- test_ergonomics.py
   |-- models/
   |   +-- face_landmarker.task  # MediaPipe vision model bundle
   |-- requirements.txt          # Python dependencies (zero bloat, pure NumPy)
@@ -108,13 +130,16 @@ python evaluate_accuracy.py             # Benchmark using trained polynomial rid
 
 ---
 
-## Future Enhancement Roadmap
+## Feature Roadmap
 
 - [x] **Interactive Multi-Point Calibration Wizard**: Fullscreen 9-point targets for polynomial ridge gaze mapping.
 - [x] **Neural Facial Blendshapes**: MediaPipe deep learning blendshape integration for false-positive-free clicking.
 - [x] **Posture & Depth Normalization**: 3D Inter-Ocular Distance scaling.
 - [x] **Empirical Accuracy Benchmark Harness**: Ground-truth pixel error evaluation tool.
-- [ ] **Dwell Clicking**: Hover on a target for 0.8s with a circular countdown ring to trigger click without winking.
-- [ ] **Edge-Scroll Gesture Detection**: Looking at the extreme top/bottom edges of the screen triggers smooth document scrolling.
+- [x] **Hands-Free Dwell Clicking**: Hover on a target for 0.75s with a circular countdown ring to trigger click without winking.
+- [x] **I-VT Eye Movement Classification**: Real-time saccade vs. fixation identification with zero-latency saccade snapping.
+- [x] **Smooth Edge-Scroll Gesture**: Looking at the extreme top/bottom edges of the screen triggers smooth document scrolling.
+- [x] **3D Metric Head Pose**: Real $SE(3)$ transformation matrix extraction for true metric 3D Euler angles.
 - [ ] **System Tray Minimization**: Run in background with global hotkeys and tray icon.
+
 
